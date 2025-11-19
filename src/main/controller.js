@@ -1,13 +1,14 @@
-const { ipcRenderer, shell } = require('electron');
-const os = require('os');
+// Modules available in the secure Renderer context
 const path = require('path');
 
-const { execSync } = require('child_process');
-const fileIcon = require('file-icon');
+// Global API exposed by the preload script
+const { api } = window;
 
-const { mojaveDarwinMinVersion } = require('../../utils/config');
-const { findAppFilesToRemove } = require('./index');
+// --- Constants ---
+const FILE_ITEM_CLASS = 'fileItem';
+const HANDLE_ERROR_CHANNEL = 'handle-error';
 
+// --- UI Elements (Updated for max-len compliance) ---
 const dropZone = document.getElementById('drag-drop-zone');
 const dropZoneText = document.getElementById('drag-drop-zone-text');
 const dropZoneImage = document.getElementById('drag-drop-zone-image');
@@ -23,8 +24,6 @@ const addFileImage = '../../assets/img/add_files.svg';
 let globAppName = '';
 
 const isValidApp = (appPath) => path.extname(appPath) === '.app';
-
-const getAppIcon = (bundleId) => fileIcon.buffer(bundleId);
 
 const getSelectedFiles = () => [...document.querySelectorAll('input[name=checkbox]:checked')].map(
   (item) => item.value,
@@ -44,71 +43,55 @@ function clearList() {
   deleteButton.disabled = true;
 }
 
-async function closeRunningApplication() {
-  try {
-    await execSync(`osascript -e 'quit app "${globAppName}"'`);
-  } catch (err) {
-    console.error(err);
-    ipcRenderer.send('handleError', 'Unable to close running application');
-  }
+// SECURE: Now sends a request to the Main Process
+function closeRunningApplication() {
+  api.send('close-app-request', globAppName);
 }
 
+// SECURE: Now handles trashing files via invoke
 async function moveFilesToTrash() {
-  try {
-    closeRunningApplication();
-    const selectedFiles = getSelectedFiles();
+  const selectedFiles = getSelectedFiles();
+  closeRunningApplication(); // Send request to close app
 
-    const spOptions = {
-      name: 'App Eraser',
-    };
+  const confirmDialogResp = await api.invoke(
+    'confirm-dialog',
+    'Are you sure?',
+    `${selectedFiles.length} files will be moved to trash`,
+  );
 
-    const posixFile = `POSIX file \\"${selectedFiles.join(
-      '\\", POSIX file \\"',
-    )}\\"`;
-
-    await execSync(
-      `osascript -e "tell application \\"Finder\\" to delete { ${posixFile} } "`,
-      spOptions,
-    ).toString();
-    clearList();
-  } catch (err) {
-    console.error(err);
-    ipcRenderer.send(
-      'handleError',
-      `Please update your permissions in System Preferences > Security and Privacy > Privacy > Automation and enable the Finder permission for App Eraser.
-      \r\nYou can learn more about permissions in the Permissions screen under Help in the tool bar.`,
-    );
+  if (confirmDialogResp.response === 0) {
+    try {
+      const response = await api.invoke('trash-files', selectedFiles);
+      if (response.success) {
+        clearList();
+      } else if (response.error) {
+        api.send(HANDLE_ERROR_CHANNEL, response.message);
+      }
+    } catch (err) {
+      api.send(HANDLE_ERROR_CHANNEL, err.message);
+    }
   }
-}
-
-async function getBundleIdentifier(appName) {
-  const bundleId = await execSync(
-    `osascript -e 'id of app "${appName}"'`,
-  ).toString();
-  console.log('bundleId', bundleId);
-  // remove empty space at end of string
-  return bundleId.substring(0, bundleId.length - 1);
 }
 
 function appNameFromPath(appPath) {
   const pathArr = appPath.split('/');
   const appNameWithExt = pathArr[pathArr.length - 1];
-  // remove .app extension
   return appNameWithExt.replace('.app', '');
 }
 
+// SECURE: Command sent to Main Process to use shell.showItemInFolder
 function openInFinder(filePath) {
-  shell.showItemInFolder(filePath);
+  api.send('show-in-finder', filePath);
 }
 
-function listItem(filePath, index) {
+function listItem(filePath, index) { // eslint-disable-line no-unused-vars
   const isEven = index % 2 === 0;
   const div = document.createElement('div');
   if (isEven) {
-    div.classList.add('fileItem');
+    div.classList.add(FILE_ITEM_CLASS);
     div.classList.add('fileItem1');
   } else {
-    div.classList.add('fileItem');
+    div.classList.add(FILE_ITEM_CLASS);
     div.classList.add('fileItem2');
   }
 
@@ -122,11 +105,11 @@ function listItem(filePath, index) {
   checkbox.style.display = 'inline-block';
 
   const appNameLabel = document.createElement('p');
-  appNameLabel.classList.add('fileItemAppName');
+  appNameLabel.classList.add(`${FILE_ITEM_CLASS}AppName`);
 
   const filePathLabel = document.createElement('label');
   filePathLabel.htmlFor = 'checkbox';
-  filePathLabel.classList.add('fileItemPathLabel');
+  filePathLabel.classList.add(`${FILE_ITEM_CLASS}PathLabel`);
 
   appNameLabel.appendChild(document.createTextNode(filePath.split('/').slice(-1)));
   filePathLabel.appendChild(document.createTextNode(filePath.split('/').slice(0, -1).join('/')));
@@ -150,21 +133,23 @@ async function appSelectionHandler(appPath) {
   clearList();
   if (isValidApp(appPath)) {
     globAppName = appNameFromPath(appPath);
-    const bundleId = await getBundleIdentifier(globAppName);
-    if (os.release() > mojaveDarwinMinVersion) {
-      try {
-        const appIconBuffer = await getAppIcon(bundleId);
-        dropZoneImage.src = `data:image/png;base64,${appIconBuffer.toString(
-          'base64',
-        )}`;
-      } catch (err) {
-        dropZoneImage.src = filesImage;
-      }
+
+    // SECURE: Fetch all required info from Main Process in one consolidated request
+    const appInfo = await api.invoke('get-app-info', globAppName);
+    if (appInfo.error) {
+      api.send(HANDLE_ERROR_CHANNEL, appInfo.message);
+      loadingContainer.style.display = 'none';
+      return;
+    }
+
+    const { appIconBuffer, appFiles } = appInfo;
+
+    if (appIconBuffer) {
+      dropZoneImage.src = `data:image/png;base64,${appIconBuffer}`;
     } else {
       dropZoneImage.src = filesImage;
     }
 
-    const appFiles = await findAppFilesToRemove(globAppName, bundleId);
     appFiles.forEach((filePath, i) => {
       listItem(filePath, i);
     });
@@ -174,51 +159,50 @@ async function appSelectionHandler(appPath) {
     clearButton.style.display = 'block';
     deleteButton.disabled = false;
   } else {
-    ipcRenderer.send('handleError', 'Selected file is not a valid app');
+    api.send(HANDLE_ERROR_CHANNEL, 'Selected file is not a valid app');
   }
   loadingContainer.style.display = 'none';
 }
 
 async function openAppSelector() {
   loadingContainer.style.display = 'flex';
-  const selectedApp = await ipcRenderer.invoke('selectAppFromFinder');
-  if (selectedApp) appSelectionHandler(selectedApp);
+  // SECURE: Invoke dialog.showOpenDialog via the secure bridge
+  const selectedApp = await api.invoke('select-app-from-finder');
+
+  if (selectedApp && !selectedApp.error) appSelectionHandler(selectedApp);
   else loadingContainer.style.display = 'none';
 }
 
 deleteButton.addEventListener('click', async () => {
-  const selectedFiles = getSelectedFiles();
-
-  const confirmDialogResp = await ipcRenderer.invoke(
-    'confirmDialog',
-    'Are you sure?',
-    `${selectedFiles.length} files will be moved to trash`,
-  );
-
-  if (confirmDialogResp.response === 0) {
-    moveFilesToTrash();
-  }
+  moveFilesToTrash();
 });
 
 clearButton.addEventListener('click', () => {
   clearList();
 });
 
-dropZone.addEventListener('click', openAppSelector);
+// FIX 1: Click handler for opening the file dialog
+// Wrapping the function call ensures the correct asynchronous execution context is preserved.
+dropZone.addEventListener('click', () => openAppSelector());
 
+// FIX 2: Implement the drop listener to rely on the window message from preload
 dropZone.addEventListener('drop', (event) => {
   event.preventDefault();
   event.stopPropagation();
-
-  const { files } = event.dataTransfer;
-
-  Object.keys(files).forEach((f) => {
-    // Using the path attribute to get absolute file path
-    appSelectionHandler(files[`${f}`].path);
-  });
+  // The path is captured by preload.js and sent via window.postMessage;
+  // we handle the logic in the window message listener below.
 });
 
-dropZone.addEventListener('dragover', (e) => {
-  e.preventDefault();
-  e.stopPropagation();
+// --- CRITICAL D&D FIX: Listener for secure file path message ---
+window.addEventListener('message', (event) => {
+  // SECURITY CHECK: Only process messages from the expected origin (local file)
+  if (event.origin !== window.location.origin) return;
+
+  // Check if the message contains the file path data
+  if (event.data.type === 'dropped-file-path') {
+    const filePath = event.data.detail;
+    if (filePath) {
+      appSelectionHandler(filePath);
+    }
+  }
 });
